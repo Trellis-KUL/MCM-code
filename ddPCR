@@ -1,0 +1,589 @@
+# ddPCR MCM with reverse inverse chi square distribution
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import gamma
+
+
+# ============================================================================
+# EASILY ADJUSTABLE PRECISION PARAMETERS - CONCENTRATION SPECIFIC (ddPCR)
+# ============================================================================
+
+# Define concentrations (Copies/μL)
+concentrations = [8000, 5000, 100, 10, 5]
+
+# Precision as CV % for each concentration (EASILY ADJUSTABLE)
+# Between-series (run-to-run) variation - PROSPECTIVE TARGET
+BW_CV_PER_CONC = [1, 1, 1, 1, 5]  # Target between-series CV (%)
+
+# Repeatability - measured from your data or set to 0 if using parameter-level uncertainty
+REPEATABILITY_CV_PER_CONC = [0, 0, 0, 0, 0]  # Set to 0 (parameter uncertainty captures this)
+
+# Replicates per concentration (your actual design)
+N_REPLICATES_PER_CONC = [4, 4, 4, 4, 5] # Number of droplet partitions measured
+
+# Experimental design (EASILY ADJUSTABLE)
+P_SERIES = 5  # Target number of validation runs
+
+# Degrees of freedom
+DF_BW = P_SERIES - 1  # df for between-series variance
+
+print("="*80)
+print("ddPCR MCM PRECISION SIMULATION SETTINGS (CONCENTRATION-SPECIFIC)")
+print("="*80)
+print(f"Number of series (p): {P_SERIES}")
+print(f"Degrees of freedom (between-series): {DF_BW}")
+print("\nConcentration-Specific Settings:")
+print("-" * 80)
+for i, conc in enumerate(concentrations):
+    n_rep = N_REPLICATES_PER_CONC[i]
+    df_rep = P_SERIES * (n_rep - 1)
+    print(f"  {conc:.2e} Copies/μL: BW CV = {BW_CV_PER_CONC[i]:5.1f}%, Rep CV = {REPEATABILITY_CV_PER_CONC[i]:5.1f}%, n = {n_rep}, df_rep = {df_rep}")
+print("="*80)
+
+
+# ============================================================================
+# VALIDATION CRITERIA PARAMETERS - EASILY ADJUSTABLE
+# ============================================================================
+
+MCM_MEAN_BIAS_LIMIT = 30
+MCM_ACCEPTANCE_RATE_TARGET = 95
+MCM_INDIVIDUAL_BIAS_LIMIT = 30
+
+print("\nVALIDATION CRITERIA SETTINGS")
+print("="*80)
+print(f"MCM Mean Bias Limit: ±{MCM_MEAN_BIAS_LIMIT}%")
+print(f"MCM Acceptance Rate Target: ≥{MCM_ACCEPTANCE_RATE_TARGET}%")
+print(f"MCM Individual Bias Limit: ±{MCM_INDIVIDUAL_BIAS_LIMIT}%")
+print("Chauvenet's Criterion: Applied to each MCM distribution")
+print("="*80)
+
+
+# ----------------------------------------------------------------------------
+# Utilities
+# ----------------------------------------------------------------------------
+
+def rinvchisq(n, df, variance_estimate):
+    """
+    Generate variance samples following inverse chi-square distribution
+    Models uncertainty in variance estimates from small samples
+    """
+    alpha = df / 2.0
+    beta = alpha * variance_estimate
+    draws = 1.0 / gamma.rvs(alpha, scale=1/beta, size=n)
+    return draws
+
+
+def sampleNormDist(Dist_mean, Dist_std, sample_size):
+    return np.random.normal(Dist_mean, Dist_std, sample_size)
+
+
+def apply_chauvenet_criterion(data):
+    chauvenet_table = {
+        3: 1.38, 4: 1.54, 5: 1.65, 6: 1.73, 7: 1.80, 8: 1.86, 9: 1.91, 10: 1.96,
+        15: 2.13, 20: 2.24, 25: 2.33, 30: 2.39, 50: 2.57, 100: 2.81, 300: 3.14,
+        500: 3.29, 1000: 3.48, 2000: 3.71, 5000: 3.97, 10000: 4.16, 50000: 4.50,
+        100000: 4.42
+    }
+    N = len(data)
+    if N in chauvenet_table:
+        chauvenet_factor = chauvenet_table[N]
+    else:
+        available = sorted(chauvenet_table.keys())
+        if N > available[-1]:
+            chauvenet_factor = chauvenet_table[available[-1]]
+        elif N < available[0]:
+            chauvenet_factor = chauvenet_table[available[0]]
+        else:
+            lower = max(s for s in available if s <= N)
+            upper = min(s for s in available if s >= N)
+            fl = chauvenet_table[lower]; fu = chauvenet_table[upper]
+            chauvenet_factor = fl + (fu - fl) * (N - lower) / (upper - lower)
+    mean_val = np.mean(data)
+    std_val = np.std(data, ddof=1)
+    max_dev = chauvenet_factor * std_val
+    mask = np.abs(data - mean_val) <= max_dev
+    cleaned = data[mask]
+    return cleaned, N - len(cleaned), chauvenet_factor
+
+
+def find_reportable_range_by_interpolation(mcm_results, acceptance_limit=30):
+    """
+    Find reportable range where BOTH upper and lower expanded uncertainty bounds are within ±acceptance_limit
+    """
+    from scipy.interpolate import interp1d
+
+    results_sorted = sorted(mcm_results, key=lambda x: x['concentration'])
+    concentrations_arr = np.array([r['concentration'] for r in results_sorted])
+    lower_bounds = np.array([r['eu_lower_95'] for r in results_sorted])
+    upper_bounds = np.array([r['eu_upper_95'] for r in results_sorted])
+
+    log_concs = np.log10(concentrations_arr)
+
+    if len(concentrations_arr) > 1:
+        try:
+            lower_interp = interp1d(log_concs, lower_bounds, kind='linear', fill_value='extrapolate')
+            upper_interp = interp1d(log_concs, upper_bounds, kind='linear', fill_value='extrapolate')
+
+            log_conc_fine = np.linspace(log_concs.min(), log_concs.max(), 1000)
+            lower_fine = lower_interp(log_conc_fine)
+            upper_fine = upper_interp(log_conc_fine)
+            conc_fine = 10**log_conc_fine
+
+            valid_mask = (lower_fine >= -acceptance_limit) & (upper_fine <= acceptance_limit)
+
+            if np.any(valid_mask):
+                valid_indices = np.where(valid_mask)[0]
+                lloq_conc = conc_fine[valid_indices[0]]
+                uloq_conc = conc_fine[valid_indices[-1]]
+
+                return {
+                    'lloq': lloq_conc,
+                    'uloq': uloq_conc,
+                    'valid': True,
+                    'tested_range': (concentrations_arr.min(), concentrations_arr.max()),
+                    'lloq_lower_bound': lower_interp(np.log10(lloq_conc)),
+                    'lloq_upper_bound': upper_interp(np.log10(lloq_conc)),
+                    'uloq_lower_bound': lower_interp(np.log10(uloq_conc)),
+                    'uloq_upper_bound': upper_interp(np.log10(uloq_conc))
+                }
+        except Exception as e:
+            print(f"  Warning: Interpolation failed: {e}")
+
+    return {'valid': False}
+
+
+# ----------------------------------------------------------------------------
+# MCM core with CHI-SQUARE precision simulation - ddPCR SPECIFIC
+# ----------------------------------------------------------------------------
+
+def run_mcm_with_chi_square_precision(n_trial=100000):
+    # ddPCR parameters - YOUR MEASURED DATA
+    N_neg_mean = [19.25, 236.25 , 16646.75, 18561, 18836]
+    N_neg_std = [8.341, 46.99, 855.85, 354.78, 809.62]
+
+    P_mean = [17390, 16727.5, 1406, 170.0, 93.75]
+    P_std = [673.006, 388.1284, 89.02, 15.14, 11.08]
+
+    T_mean = [17409.25, 16963.75, 18052.75, 18731, 18929.75]
+    T_std = [679.89, 348.38, 859.94, 349.268, 819.04]
+
+    V_droplet_mean = 0.00085
+    V_droplet_std = 0.00  # No uncertainty in droplet volume
+
+    print(f"\nRunning ddPCR MCM simulations with {n_trial} trials per concentration...")
+    print("Using CHI-SQUARE distribution for precision variance sampling")
+    print("Using CONCENTRATION-SPECIFIC precision parameters and replicates")
+    print("CORRECTED: Parameters sampled independently for each replicate\n")
+
+    mcm_distributions = []
+
+    for i, true_conc in enumerate(concentrations):
+        # Get concentration-specific parameters
+        BW_CV = BW_CV_PER_CONC[i]
+        REPEATABILITY_CV = REPEATABILITY_CV_PER_CONC[i]
+        N_REPLICATES = N_REPLICATES_PER_CONC[i]
+
+        # Calculate concentration-specific degrees of freedom
+        DF_REPEATABILITY = P_SERIES * (N_REPLICATES - 1)
+
+        print(f"\nSimulating concentration {i+1}/{len(concentrations)}: {true_conc:.2e} Copies/μL")
+        print(f"  Using BW CV = {BW_CV:.1f}%, Repeatability CV = {REPEATABILITY_CV:.1f}%, n_replicates = {N_REPLICATES}")
+        print(f"  Degrees of freedom: BW = {DF_BW}, Repeatability = {DF_REPEATABILITY}")
+
+        # Calculate variance estimates
+        var_BW_estimate = (BW_CV/100.0 * true_conc) ** 2
+        var_Rep_estimate = (REPEATABILITY_CV/100.0 * true_conc) ** 2
+
+        print(f"  Between-series variance estimate: {var_BW_estimate:.2e}")
+        print(f"  Repeatability variance estimate: {var_Rep_estimate:.2e}")
+
+        # Generate variance distributions using INVERSE CHI-SQUARE
+        variance_BW_samples = rinvchisq(n_trial, DF_BW, var_BW_estimate)
+
+        # Handle zero repeatability CV
+        if REPEATABILITY_CV > 0 and DF_REPEATABILITY > 0:
+            variance_Rep_samples = rinvchisq(n_trial, DF_REPEATABILITY, var_Rep_estimate)
+            print(f"  BW variance samples: mean={np.mean(variance_BW_samples):.2e}, "
+                  f"min={np.min(variance_BW_samples):.2e}, max={np.max(variance_BW_samples):.2e}")
+            print(f"  Rep variance samples: mean={np.mean(variance_Rep_samples):.2e}, "
+                  f"min={np.min(variance_Rep_samples):.2e}, max={np.max(variance_Rep_samples):.2e}")
+        else:
+            variance_Rep_samples = np.zeros(n_trial)
+            print(f"  BW variance samples: mean={np.mean(variance_BW_samples):.2e}, "
+                  f"min={np.min(variance_BW_samples):.2e}, max={np.max(variance_BW_samples):.2e}")
+            print(f"  Rep variance samples: All zeros (repeatability in parameter uncertainty)")
+
+        # Initialize array for replicates
+        X_replicates = np.zeros((n_trial, N_REPLICATES))
+
+        # CORRECTED: For each trial, generate replicates with INDEPENDENT parameter sampling
+        for trial in range(n_trial):
+            # Sample SD from chi-square distributed variances
+            sd_BW_this_trial = np.sqrt(variance_BW_samples[trial])
+            sd_Rep_this_trial = np.sqrt(variance_Rep_samples[trial])
+
+            # Add between-series error (same for all replicates in this trial/series)
+            BW_error = np.random.normal(0, sd_BW_this_trial)
+
+            # CORRECTED: Sample ddPCR parameters independently for EACH replicate
+            for rep in range(N_REPLICATES):
+                # Each replicate gets independent parameter samples (all scalars)
+                N_neg_this_rep = np.random.normal(N_neg_mean[i], N_neg_std[i])
+                P_this_rep = np.random.normal(P_mean[i], P_std[i])
+                T_this_rep = np.random.normal(T_mean[i], T_std[i])
+                V_droplet_this_rep = V_droplet_mean  # Scalar, no uncertainty
+
+                # Calculate concentration using conditional formula (scalar operations)
+                # FIXED: No array indexing - direct scalar calculation
+                if N_neg_this_rep < T_this_rep / 2:
+                    X_true_replicate = -np.log(N_neg_this_rep / T_this_rep) / V_droplet_this_rep
+                else:
+                    X_true_replicate = -np.log(1 - P_this_rep / T_this_rep) / V_droplet_this_rep
+
+                # Add between-series error (shared) and repeatability error (independent)
+                Rep_error = np.random.normal(0, sd_Rep_this_trial)
+                X_replicates[trial, rep] = X_true_replicate + BW_error + Rep_error
+
+        # Take mean across replicates (averaging effect works!)
+        X_mcm = np.mean(X_replicates, axis=1)
+
+        # Remove invalid values
+        valid_mask = np.isfinite(X_mcm) & (X_mcm > 0)
+        X_clean_initial = X_mcm[valid_mask]
+
+        print(f"  Initial valid simulations: {len(X_clean_initial):,}/{n_trial:,}")
+
+        # Apply Chauvenet criterion
+        X_clean_chauvenet, outliers_removed, chauvenet_factor = apply_chauvenet_criterion(X_clean_initial)
+
+        print(f"  Chauvenet factor: {chauvenet_factor:.2f}")
+        print(f"  Outliers removed by Chauvenet: {outliers_removed:,}")
+        print(f"  Final cleaned data points: {len(X_clean_chauvenet):,}")
+        print(f"  Outlier percentage: {(outliers_removed/len(X_clean_initial)*100):.2f}%")
+
+        # Calculate bias distribution
+        mcm_bias_distribution = ((X_clean_chauvenet - true_conc) / true_conc) * 100
+
+        mcm_distributions.append({
+            'concentration': true_conc,
+            'BW_CV': BW_CV,
+            'REPEATABILITY_CV': REPEATABILITY_CV,
+            'N_REPLICATES': N_REPLICATES,
+            'DF_REPEATABILITY': DF_REPEATABILITY,
+            'X_mcm': X_clean_chauvenet,
+            'X_mcm_original': X_clean_initial,
+            'mcm_bias_distribution': mcm_bias_distribution,
+            'outliers_removed': outliers_removed,
+            'chauvenet_factor': chauvenet_factor,
+            'outlier_percentage': (outliers_removed/len(X_clean_initial)*100),
+            'variance_BW_samples': variance_BW_samples,
+            'variance_Rep_samples': variance_Rep_samples
+        })
+
+    return mcm_distributions
+
+
+def evaluate_mcm_validation_with_chauvenet(mcm_distributions):
+    print(f"\nEvaluating MCM with Chauvenet-cleaned data:")
+    print(f"  Mean bias limit: ±{MCM_MEAN_BIAS_LIMIT}%")
+    print(f"  Acceptance rate target: ≥{MCM_ACCEPTANCE_RATE_TARGET}%")
+    print(f"  Expanded Uncertainty criterion: Both bounds within ±{MCM_INDIVIDUAL_BIAS_LIMIT}%")
+
+    mcm_results = []
+    for mcm_data in mcm_distributions:
+        conc = mcm_data['concentration']
+        bias_dist = mcm_data['mcm_bias_distribution']
+        X_clean = mcm_data['X_mcm']
+
+        mean_bias = np.mean(bias_dist)
+        mean_bias_absolute = (mean_bias / 100) * conc
+        std_bias_relative = np.std(bias_dist)
+
+        mcm_abs_mean = np.mean(X_clean)
+        mcm_abs_std = np.std(X_clean)
+        mcm_abs_min = np.min(X_clean)
+        mcm_abs_max = np.max(X_clean)
+        mcm_abs_range = mcm_abs_max - mcm_abs_min
+
+        abs_bias_dist = X_clean - conc
+        abs_bias_mean = np.mean(abs_bias_dist)
+        abs_bias_std = np.std(abs_bias_dist)
+
+        acceptance_rate = (np.sum(np.abs(bias_dist) <= MCM_INDIVIDUAL_BIAS_LIMIT) / len(bias_dist)) * 100
+
+        u_c = np.std(bias_dist)
+        U_95 = 1.96 * u_c
+        eu_lower = mean_bias - U_95
+        eu_upper = mean_bias + U_95
+
+        u_c_abs = np.std(abs_bias_dist)
+        U_95_abs = 1.96 * u_c_abs
+
+        pass_expanded_uncertainty = (eu_lower >= -MCM_INDIVIDUAL_BIAS_LIMIT) and (eu_upper <= MCM_INDIVIDUAL_BIAS_LIMIT)
+
+        mean_bias_valid = abs(mean_bias) <= MCM_MEAN_BIAS_LIMIT
+        acceptance_rate_valid = acceptance_rate >= MCM_ACCEPTANCE_RATE_TARGET
+        mcm_overall_valid = mean_bias_valid and acceptance_rate_valid
+
+        mcm_results.append({
+            'concentration': conc,
+            'BW_CV': mcm_data['BW_CV'],
+            'REPEATABILITY_CV': mcm_data['REPEATABILITY_CV'],
+            'N_REPLICATES': mcm_data['N_REPLICATES'],
+            'DF_REPEATABILITY': mcm_data['DF_REPEATABILITY'],
+            'mean_bias': mean_bias,
+            'mean_bias_absolute': mean_bias_absolute,
+            'std_bias_relative': std_bias_relative,
+            'u_combined': u_c,
+            'expanded_uncertainty': U_95,
+            'eu_lower_95': eu_lower,
+            'eu_upper_95': eu_upper,
+            'mcm_abs_mean': mcm_abs_mean,
+            'mcm_abs_std': mcm_abs_std,
+            'mcm_abs_min': mcm_abs_min,
+            'mcm_abs_max': mcm_abs_max,
+            'mcm_abs_range': mcm_abs_range,
+            'abs_bias_mean': abs_bias_mean,
+            'abs_bias_std': abs_bias_std,
+            'u_combined_abs': u_c_abs,
+            'expanded_uncertainty_abs': U_95_abs,
+            'acceptance_rate': acceptance_rate,
+            'pass_expanded_uncertainty': pass_expanded_uncertainty,
+            'mean_bias_valid': mean_bias_valid,
+            'acceptance_rate_valid': acceptance_rate_valid,
+            'mcm_overall_valid': mcm_overall_valid,
+            'bias_distribution': bias_dist,
+            'outliers_removed': mcm_data['outliers_removed'],
+            'chauvenet_factor': mcm_data['chauvenet_factor'],
+            'outlier_percentage': mcm_data['outlier_percentage'],
+            'original_data_size': len(mcm_data['X_mcm_original']),
+            'cleaned_data_size': len(mcm_data['X_mcm'])
+        })
+
+        print(f"  {conc:.1e}: Mean bias = {mean_bias:6.1f}% ({mean_bias_absolute:.1e} Copies/μL) ({'PASS' if mean_bias_valid else 'FAIL'}), "
+              f"Accept rate = {acceptance_rate:5.1f}% ({'PASS' if acceptance_rate_valid else 'FAIL'}), "
+              f"Expanded uncertainty within ±{MCM_INDIVIDUAL_BIAS_LIMIT}% = {'YES' if pass_expanded_uncertainty else 'NO'} "
+              f"→ {'VALID' if mcm_overall_valid else 'INVALID'}")
+    return mcm_results
+
+
+def create_mcm_plots(mcm_results):
+    import matplotlib.pyplot as plt
+
+    mcm_results_reversed = mcm_results[::-1]
+    fig = plt.figure(figsize=(16, 12))
+    concentrations_plot = [r['concentration'] for r in mcm_results_reversed]
+    conc_labels = [f'{c:.1e}' for c in concentrations_plot]
+    positions = np.arange(len(concentrations_plot))
+
+    mcm_bias_distributions = [r['bias_distribution'] for r in mcm_results_reversed]
+    mcm_lower = [r['eu_lower_95'] for r in mcm_results_reversed]
+    mcm_upper = [r['eu_upper_95'] for r in mcm_results_reversed]
+    mcm_means = [r['mean_bias'] for r in mcm_results_reversed]
+    acceptance_rates = [r['acceptance_rate'] for r in mcm_results_reversed]
+    mcm_acceptance_valid = [r['acceptance_rate_valid'] for r in mcm_results_reversed]
+    outlier_percentages = [r['outlier_percentage'] for r in mcm_results_reversed]
+    n_replicates_list = [r['N_REPLICATES'] for r in mcm_results_reversed]
+    colors = ['blue', 'red', 'green', 'orange', 'purple']
+
+    # Plot 1: Bias Distribution
+    ax1 = plt.subplot(2, 2, 1)
+    ax1.plot(positions, mcm_means, 'r-', linewidth=3, marker='o', markersize=8,
+             label='Mean Relative Bias', zorder=5)
+    ax1.plot(positions, mcm_upper, 'b--', linewidth=2, alpha=1.0,
+             label='Expanded Uncertainty (k=2)', zorder=4)
+    ax1.plot(positions, mcm_lower, 'b--', linewidth=2, alpha=1.0, zorder=4)
+    ax1.fill_between(positions, mcm_lower, mcm_upper, alpha=0.1, color='blue', zorder=1)
+
+    max_vals = []
+    for i, bias_vals in enumerate(mcm_bias_distributions):
+        n_scatter = min(200, len(bias_vals))
+        if len(bias_vals) > 0:
+            idx = np.random.choice(len(bias_vals), n_scatter, replace=False)
+            vals = np.array(bias_vals)[idx]
+            xjit = np.random.normal(i, 0.05, len(vals))
+            ax1.scatter(xjit, vals, alpha=0.3, s=8, color=colors[i % len(colors)], zorder=2)
+            max_vals.append(np.max(vals))
+        else:
+            max_vals.append(mcm_upper[i])
+
+    for i, n_rep in enumerate(n_replicates_list):
+        y_pos = max_vals[i] + 1
+        label_text = f'n={n_rep}'
+        ax1.text(i, y_pos, label_text,
+                 ha='center', va='bottom', fontsize=10, fontweight='bold',
+                 bbox=dict(boxstyle='round,pad=0.4', facecolor='lightyellow', alpha=0.8, edgecolor='gray'))
+
+    ax1.axhline(y=MCM_INDIVIDUAL_BIAS_LIMIT, color='black', linestyle='--', linewidth=2,
+                label=f'Acceptance Limits (±{MCM_INDIVIDUAL_BIAS_LIMIT}%)', zorder=3)
+    ax1.axhline(y=-MCM_INDIVIDUAL_BIAS_LIMIT, color='black', linestyle='--', linewidth=2, zorder=3)
+    ax1.axhline(y=0, color='gray', linestyle='-', linewidth=1, alpha=0.5, zorder=3)
+    ax1.set_xticks(positions); ax1.set_xticklabels(conc_labels, rotation=45, ha='right')
+    ax1.set_xlabel('Concentration (Copies/μL)'); ax1.set_ylabel('Relative Error (%)')
+    ax1.set_title('ddPCR MCM Bias Distribution\n(Chi-Square Precision - Corrected Replicate Averaging)')
+    ax1.grid(True, alpha=0.3); ax1.legend(fontsize=10)
+
+    # Plot 2: Acceptance Rate
+    ax2 = plt.subplot(2, 2, 2)
+    bar_colors = []
+    for r in mcm_results_reversed:
+        if r['pass_expanded_uncertainty']:
+            bar_colors.append('green')
+        else:
+            bar_colors.append('red')
+    bars2 = ax2.bar(positions, acceptance_rates, color=bar_colors, alpha=0.7, edgecolor='black', linewidth=1)
+    ax2.axhline(y=95, color='green', linestyle='--', linewidth=2, label='95% Excellent')
+    ax2.axhline(y=MCM_ACCEPTANCE_RATE_TARGET, color='orange', linestyle='-', linewidth=2,
+                label=f'{MCM_ACCEPTANCE_RATE_TARGET}% Target')
+    ax2.set_xticks(positions); ax2.set_xticklabels(conc_labels, rotation=45, ha='right')
+    ax2.set_xlabel('Concentration (Copies/μL)'); ax2.set_ylabel(f'% Within ±{MCM_INDIVIDUAL_BIAS_LIMIT}% Bias')
+    ax2.set_title('ddPCR MCM Acceptance Rate')
+    ax2.grid(True, alpha=0.3); ax2.legend(); ax2.set_ylim(0, 105)
+    for bar, rate, valid in zip(bars2, acceptance_rates, mcm_acceptance_valid):
+        h = bar.get_height()
+        color = 'darkgreen' if valid else 'darkred'
+        ax2.text(bar.get_x() + bar.get_width()/2., h + 1, f'{rate:.1f}%', ha='center', va='bottom',
+                 fontweight='bold', color=color)
+
+    # Plot 3: Outlier Analysis
+    ax3 = plt.subplot(2, 2, 3)
+    bars3 = ax3.bar(positions, outlier_percentages, color='coral', alpha=0.7,
+                    edgecolor='black', linewidth=1)
+    ax3.axhline(y=1.0, color='green', linestyle='--', linewidth=2, label='1% Good')
+    ax3.axhline(y=2.5, color='orange', linestyle='--', linewidth=2, label='2.5% Acceptable')
+    ax3.axhline(y=5.0, color='red', linestyle='--', linewidth=2, label='5% High')
+    ax3.set_xticks(positions); ax3.set_xticklabels(conc_labels, rotation=45, ha='right')
+    ax3.set_xlabel('Concentration (Copies/μL)'); ax3.set_ylabel('Outliers Removed (%)')
+    ax3.set_title('Chauvenet Criterion\nOutlier Removal Analysis')
+    ax3.grid(True, alpha=0.3); ax3.legend()
+    max_outlier_pct = max(outlier_percentages) if outlier_percentages else 0.15
+    y_limit = max(max_outlier_pct * 1.5, 0.15)
+    ax3.set_ylim(0, y_limit)
+    for bar, pct in zip(bars3, outlier_percentages):
+        h = bar.get_height()
+        label_y = min(h + 0.005, y_limit - 0.02)
+        ax3.text(bar.get_x() + bar.get_width()/2., label_y, f'{pct:.2f}%', ha='center', va='bottom',
+                 fontweight='bold', fontsize=10)
+
+    # Plot 4: Precision Components Text Summary
+    ax4 = plt.subplot(2, 2, 4)
+    ax4.axis('off')
+
+    precision_table = "\n    Concentration-Specific Parameters:\n"
+    for i, (conc, bw, rep, n_rep) in enumerate(zip(concentrations, BW_CV_PER_CONC, REPEATABILITY_CV_PER_CONC, N_REPLICATES_PER_CONC)):
+        df_rep = P_SERIES * (n_rep - 1)
+        precision_table += f"    {conc:.1e}:\n"
+        precision_table += f"      BW={bw:.1f}%, Rep={rep:.1f}%\n"
+        precision_table += f"      n={n_rep}, df_rep={df_rep}\n"
+
+    summary_text = f"""
+    ddPCR PRECISION MODEL SUMMARY
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    Using CHI-SQUARE Distribution
+    (Correct for variance uncertainty!)
+
+    Global Parameters:
+      • Series (p) = {P_SERIES}
+      • df_BW = {DF_BW}
+{precision_table}
+    CORRECTED MODEL:
+    Parameters sampled independently
+    for each replicate - averaging works!
+
+    Variance reduces by √n factor
+
+    Model Structure:
+      For each replicate:
+        N_neg, P, T ~ N(μ, σ)
+        X_rep = ddPCR_model(params)
+                + BW_error + Rep_error
+      X_final = mean(X_rep across n)
+
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    """
+    ax4.text(0.02, 0.5, summary_text, fontsize=7, family='monospace',
+             verticalalignment='center', bbox=dict(boxstyle='round',
+             facecolor='lightblue', alpha=0.5))
+
+    fig.tight_layout()
+    fig.savefig('ddpcr_mcm_chi_square_precision.png', dpi=300, bbox_inches='tight')
+    fig.savefig('ddpcr_mcm_chi_square_precision.pdf', bbox_inches='tight')
+    plt.show()
+    return fig
+
+
+def print_mcm_summary(mcm_results):
+    print("\n" + "="*120)
+    print("ddPCR MCM VALIDATION SUMMARY (CHI-SQUARE PRECISION MODEL)")
+    print("="*120)
+    print(f"MCM Mean Bias Criterion: ±{MCM_MEAN_BIAS_LIMIT}%")
+    print(f"MCM Acceptance Rate Criterion: ≥{MCM_ACCEPTANCE_RATE_TARGET}%")
+    print(f"MCM Expanded Uncertainty Criterion: Both bounds within ±{MCM_INDIVIDUAL_BIAS_LIMIT}%")
+    print(f"NOTE: Parameters sampled independently for each replicate - variance reduces by √n factor")
+
+    mcm_valid_concentrations = []
+    mcm_results_reversed = mcm_results[::-1]
+
+    eu_pass = [r for r in mcm_results_reversed if r.get('pass_expanded_uncertainty', False)]
+
+    print(f"\n{'Concentration':<15} {'n':<4} {'BW CV':<8} {'Rep CV':<8} {'Mean Bias (%)':<14} {'Accept Rate':<12} {'Exp Uncert':<12} {'Valid':<8}")
+    print("-" * 120)
+    for r in mcm_results_reversed:
+        conc = r['concentration']
+        n_rep = r['N_REPLICATES']
+        bw_cv = r['BW_CV']
+        rep_cv = r['REPEATABILITY_CV']
+        mcm_mean = r['mean_bias']
+        accept_rate = r['acceptance_rate']
+        eu_pass_status = r['pass_expanded_uncertainty']
+        mcm_valid = r['mcm_overall_valid']
+        if mcm_valid:
+            mcm_valid_concentrations.append(conc)
+        rep_display = "Params" if rep_cv == 0 else f"{rep_cv:.1f}%"
+        print(f"{conc:.2e}  {n_rep:<3}  {bw_cv:>5.1f}%  {rep_display:>7}  {mcm_mean:>11.2f}%  {accept_rate:>9.1f}%  {'YES' if eu_pass_status else 'NO':>10}  {'YES' if mcm_valid else 'NO':>6}")
+
+    if eu_pass:
+        print(f"\n  Computing interpolated reportable range...")
+        interp_range = find_reportable_range_by_interpolation(mcm_results_reversed, MCM_INDIVIDUAL_BIAS_LIMIT)
+
+        eu_concs = [r['concentration'] for r in eu_pass]
+        eu_min, eu_max = min(eu_concs), max(eu_concs)
+        print("\n" + "="*80)
+        print("REPORTABLE RANGE")
+        print("="*80)
+
+        if interp_range['valid']:
+            print(f"Interpolated Range: {interp_range['lloq']:.1e} – {interp_range['uloq']:.1e} Copies/μL")
+        else:
+            print(f"Discrete Range: {eu_min:.1e} – {eu_max:.1e} Copies/μL")
+
+    print("\n" + "="*80)
+
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+def run_chi_square_mcm_analysis():
+    print("Starting ddPCR MCM Analysis with CHI-SQUARE Precision Model...")
+    print("Using ddPCR adaptive concentration model with conditional formula")
+    print("Precision errors added separately using chi-square variance sampling")
+    print("CORRECTED: Parameters sampled independently for each replicate")
+    print("Averaging effect now works correctly - variance reduces by √n")
+    np.random.seed(0)
+
+    mcm_distributions = run_mcm_with_chi_square_precision(n_trial=100000)
+    mcm_results = evaluate_mcm_validation_with_chauvenet(mcm_distributions)
+    print("\nGenerating plots...")
+    fig = create_mcm_plots(mcm_results)
+    print_mcm_summary(mcm_results)
+    print("\n" + "="*80)
+    print("ddPCR CHI-SQUARE MCM ANALYSIS COMPLETE!")
+    print("="*80)
+    return mcm_results, fig
+
+
+# Run
+if __name__ == "__main__":
+    mcm_results, fig = run_chi_square_mcm_analysis()
