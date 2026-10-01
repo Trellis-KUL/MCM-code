@@ -1,0 +1,702 @@
+import numpy as np
+from scipy.stats import gamma
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+# ============================================================================
+# GLOBAL SETTINGS
+# ============================================================================
+# works well
+concentrations_labels = ["2.5e10", "5e10", "2e11", "4e11"]
+
+P_SERIES = 4
+N_REP_PER_SERIES = 2
+DF_BW = P_SERIES - 1                       # between-series df = n - 1 = 3
+DF_W  = P_SERIES * (N_REP_PER_SERIES - 1)  # within-series df = n(p-1) = 4
+MCM_BIAS_LIMIT = 30.0
+# Matches the Enoval report criterion: max risk 10% outside +/-30%,
+# i.e. acceptance >= 90% (report p.12). Was 95%, which was stricter than
+# the validation it is compared against and produced spurious discordance.
+MCM_ACCEPTANCE_TARGET = 90.0
+N_TRIAL = 100000
+
+colors = ["#AB63FA", "#00CC96", "#EF553B", "#636EFA"]
+
+# Heatmap settings
+HM_BW_CV_MAX = 30      # upper end of BW CV sweep (%)
+HM_N_STEPS   = 61      # number of BW CV steps
+HM_N_TRIAL   = 100000   # MCM trials per heatmap cell
+
+# ---- Bar-panel geometry ----------------------------------------------------
+# Bar panels are drawn on a CATEGORICAL x-axis (positions 0..k-1) rather than
+# on the nominal-level values. Without this, group spacing inherits the level
+# spacing, so Full (10/25/50/83) and Empty (6/43/71/88) render with unequal
+# and non-comparable gaps, and the lowest Empty group is clipped by the axis.
+BARGAP      = 0.15   # fraction of a category slot left empty between groups
+BARGROUPGAP = 0.05   # gap between bars within a group
+X_PAD       = 0.5    # axis padding either side, in category units
+
+# Panel 1 is an accuracy-profile plot; equal-interval spacing there discards
+# the quantitative spacing of the nominal levels and is arguably a
+# misrepresentation. Set False to keep panel 1 on a quantitative axis.
+PANEL1_CATEGORICAL = True
+
+# ============================================================================
+# NOMINAL LEVELS PER MODE
+#   Full samples and Empty samples are the SAME physical vials, so they pair:
+#   10%Full<->88%Empty, 25<->71, 50<->43, 83<->6
+# ============================================================================
+
+NOMINALS_FULL  = [83, 50, 25, 10]
+NOMINALS_EMPTY = [88, 71, 43, 6]
+
+# ============================================================================
+# INPUT DATA — measured mean & within-run SD per cell
+#   pf_m: measured mean (%Full or %Empty)
+#   pf_s: SD of replicates (within-run precision); all cells n=2
+# ============================================================================
+
+# ---- FULL: measured %Full ----
+data_full = {
+    ("4e11",   83): {"pf_m": 81.75, "pf_s": 1.20},
+    ("4e11",   50): {"pf_m": 53.70, "pf_s": 2.12},
+    ("4e11",   25): {"pf_m": 27.45, "pf_s": 0.64},
+    ("4e11",   10): {"pf_m":  9.65, "pf_s": 0.78},
+    ("2e11",   83): {"pf_m": 83.70, "pf_s": 0.42},
+    ("2e11",   50): {"pf_m": 51.65, "pf_s": 1.48},
+    ("2e11",   25): {"pf_m": 27.10, "pf_s": 1.27},
+    ("2e11",   10): {"pf_m":  9.95, "pf_s": 2.33},
+    ("5e10",   83): {"pf_m": 89.45, "pf_s": 3.89},
+    ("5e10",   50): {"pf_m": 51.80, "pf_s": 3.39},
+    ("5e10",   25): {"pf_m": 23.00, "pf_s": 6.65},
+    ("5e10",   10): {"pf_m": 12.90, "pf_s": 3.54},
+    ("2.5e10", 83): {"pf_m": 78.75, "pf_s": 0.78},
+    ("2.5e10", 50): {"pf_m": 53.50, "pf_s": 6.79},
+    ("2.5e10", 25): {"pf_m": 30.70, "pf_s": 4.24},
+    ("2.5e10", 10): {"pf_m": 11.15, "pf_s": 3.32},
+}
+
+# ---- EMPTY: measured %Empty (keyed by nominal %Empty 88/71/43/6) ----
+data_empty = {
+    ("4e11",   6):  {"pf_m":  5.95, "pf_s": 1.06},
+    ("4e11",   43): {"pf_m": 35.80, "pf_s": 0.85},
+    ("4e11",   71): {"pf_m": 65.15, "pf_s": 0.35},
+    ("4e11",   88): {"pf_m": 84.30, "pf_s": 0.99},
+    ("2e11",   6):  {"pf_m":  8.47, "pf_s": 2.50},
+    ("2e11",   43): {"pf_m": 37.60, "pf_s": 0.71},
+    ("2e11",   71): {"pf_m": 65.10, "pf_s": 1.56},
+    ("2e11",   88): {"pf_m": 83.25, "pf_s": 5.16},
+    ("5e10",   6):  {"pf_m":  4.30, "pf_s": 2.97},
+    ("5e10",   43): {"pf_m": 31.45, "pf_s": 1.34},
+    ("5e10",   71): {"pf_m": 67.50, "pf_s": 2.26},
+    ("5e10",   88): {"pf_m": 79.00, "pf_s": 3.82},
+    ("2.5e10", 6):  {"pf_m":  6.10, "pf_s": 3.54},
+    ("2.5e10", 43): {"pf_m": 37.55, "pf_s": 11.81},
+    ("2.5e10", 71): {"pf_m": 62.85, "pf_s": 10.54},
+    ("2.5e10", 88): {"pf_m": 82.35, "pf_s": 0.07},
+}
+
+# ============================================================================
+# PROSPECTIVE TARGET BW CV (%) used in the MAIN MCM (figures 1 & 3)
+#   *** EDIT HERE to change the assumed between-series CV per cell ***
+#   Outer key = concentration, inner key = %Full / %Empty level.
+#   (This is the prospective target — distinct from MEAS_BW_* further below,
+#    which is the MEASURED BW from validation and only drives heatmap diamonds.)
+# ============================================================================
+
+# ---- FULL target BW CV% ----
+BW_TARGET_FULL = {
+    "4e11":   {83: 5, 50: 5, 25: 5, 10: 5},
+    "2e11":    {83: 5, 50: 5, 25: 5, 10: 5},
+    "5e10":    {83: 5, 50: 5, 25: 5, 10: 5},
+    "2.5e10":  {83: 5, 50: 5, 25: 5, 10: 5},
+}
+
+# ---- EMPTY target BW CV% ----
+BW_TARGET_EMPTY = {
+    "4e11":   {88: 5, 71: 5, 43: 5, 6: 5},
+    "2e11":   {88: 5, 71: 5, 43: 5, 6: 5},
+    "5e10":   {88: 5, 71: 5, 43: 5, 6: 5},
+    "2.5e10": {88: 5, 71: 5, 43: 5, 6: 5},
+}
+
+# ============================================================================
+# REPLICATES PER CELL (n)  — *** EDIT HERE to change n per cell ***
+# ============================================================================
+
+# ---- FULL replicates ----
+NREP_FULL = {
+    "4e11":   {83: 2, 50: 2, 25: 2, 10: 2},
+    "2e11":   {83: 2, 50: 2, 25: 2, 10: 2},
+    "5e10":   {83: 2, 50: 2, 25: 2, 10: 2},
+    "2.5e10": {83: 2, 50: 2, 25: 2, 10: 2},
+}
+
+# ---- EMPTY replicates ----
+NREP_EMPTY = {
+    "4e11":   {88: 2, 71: 2, 43: 2, 6: 2},
+    "2e11":   {88: 2, 71: 2, 43: 2, 6: 2},
+    "5e10":   {88: 2, 71: 2, 43: 2, 6: 2},
+    "2.5e10": {88: 2, 71: 2, 43: 2, 6: 2},
+}
+
+# ============================================================================
+# MEASURED VALIDATION DATA — from full validation TAE tables
+#   Between-series RSD% per cell (image: Full top table / Empty bottom table).
+#   NOTE several cells are 0 — degenerate ANOVA partitions (between-series
+#   variance collapsed into repeatability). A measured BW of 0 places the
+#   diamond at x=0 (within-run only). Replace with your final value if you
+#   re-partition the variance.
+# ============================================================================
+
+# ---- FULL between-series CV% ----
+MEAS_BW_FULL = {
+    "4e11":   {83: 0.0,    50: 5.510, 25: 8.139, 10: 0.0},
+    "2e11":   {83: 2.965,  50: 0.0,   25: 8.645, 10: 0.0},
+    "5e10":   {83: 4.085,  50: 3.672, 25: 0.0,   10: 18.16},
+    "2.5e10": {83: 0.9258, 50: 9.559, 25: 3.376, 10: 32.47},
+}
+
+# ---- EMPTY between-series CV% ----
+MEAS_BW_EMPTY = {
+    "4e11":   {88: 0.0,   71: 2.994, 43: 3.052, 6: 0.0},
+    "2e11":   {88: 0.0,   71: 4.464, 43: 6.808, 6: 24.76},
+    "5e10":   {88: 3.173, 71: 0.0,   43: 7.442, 6: 0.0},
+    "2.5e10": {88: 0.0,   71: 11.11, 43: 10.69, 6: 0.0},
+}
+
+# ============================================================================
+# MEASURED VALIDATION PASS/FAIL per cell
+#   *** APPROXIMATE — read from the TAE tolerance-limit profiles. VERIFY ***
+#   These seed the concordance colouring. Any cell mismatching the MCM
+#   prediction shows ORANGE (discordant); update against your actual TAE
+#   pass/fail conclusions.
+# ============================================================================
+
+VAL_PASS_FULL = {
+    "4e11":   {83: True, 50: True,  25: True,  10: True},
+    "2e11":   {83: True, 50: True,  25: True,  10: False},
+    "5e10":   {83: True, 50: True,  25: False, 10: False},
+    "2.5e10": {83: True, 50: False, 25: False, 10: False},
+}
+
+VAL_PASS_EMPTY = {
+    "4e11":   {88: True, 71: True,  43: True,  6: True},
+    "2e11":   {88: True, 71: True,  43: True,  6: False},
+    "5e10":   {88: True, 71: True,  43: False, 6: False},
+    "2.5e10": {88: True, 71: False, 43: False, 6: False},
+}
+
+# ============================================================================
+# MODE BUNDLES
+# ============================================================================
+
+MODES = {
+    "Full": {
+        "nominals":  NOMINALS_FULL,
+        "data":      data_full,
+        "bw_target": BW_TARGET_FULL,
+        "nrep":      NREP_FULL,
+        "meas_bw":   MEAS_BW_FULL,
+        "val_pass":  VAL_PASS_FULL,
+        "axis":      "%Full",
+    },
+    "Empty": {
+        "nominals":  NOMINALS_EMPTY,
+        "data":      data_empty,
+        "bw_target": BW_TARGET_EMPTY,
+        "nrep":      NREP_EMPTY,
+        "meas_bw":   MEAS_BW_EMPTY,
+        "val_pass":  VAL_PASS_EMPTY,
+        "axis":      "%Empty",
+    },
+}
+
+# ============================================================================
+# UTILITIES
+# ============================================================================
+
+def rinvchisq(n, df, var_est):
+    # A zero (or non-positive) variance estimate means no variability to model;
+    # return zeros instead of dividing by zero.
+    if var_est <= 0:
+        return np.zeros(n)
+    alpha = df / 2.0
+    beta  = alpha * var_est
+    return 1.0 / gamma.rvs(alpha, scale=1.0 / beta, size=n)
+
+
+def apply_chauvenet(arr):
+    table = {3: 1.38,  4: 1.54,  5: 1.65,  6: 1.73,  7: 1.80,  8: 1.86,
+             9: 1.91, 10: 1.96, 15: 2.13, 20: 2.24, 25: 2.33, 30: 2.39,
+             50: 2.57, 100: 2.81, 300: 3.14, 500: 3.29, 1000: 3.48,
+             2000: 3.71, 5000: 3.97, 10000: 4.16, 50000: 4.50, 100000: 4.42}
+    N = len(arr)
+    avail = sorted(table.keys())
+    if N in table:
+        cf = table[N]
+    elif N > avail[-1]:
+        cf = table[avail[-1]]
+    elif N < avail[0]:
+        cf = table[avail[0]]
+    else:
+        lo = max(s for s in avail if s <= N)
+        hi = min(s for s in avail if s >= N)
+        cf = table[lo] + (table[hi] - table[lo]) * (N - lo) / (hi - lo)
+    mu = np.mean(arr)
+    sd = np.std(arr, ddof=1)
+    mask = np.abs(arr - mu) <= cf * sd
+    return arr[mask], int(N - mask.sum()), cf
+
+
+def _slot_offset(ci, n_series, bargap=BARGAP):
+    """Centre of bar `ci` within its group, in category-index units.
+
+    Resolution-independent, unlike a pixel-based xshift, which is tied to a
+    specific figure width and series count.
+    """
+    slot = (1.0 - bargap) / n_series
+    return (ci - (n_series - 1) / 2.0) * slot
+
+
+# ============================================================================
+# MCM SIMULATION (mode-parametrized)
+# ============================================================================
+
+def run_mp_mcm(mode_cfg, mode_name, n_trial=N_TRIAL, seed=42):
+    np.random.seed(seed)
+    results = {}
+    nominals  = mode_cfg["nominals"]
+    data      = mode_cfg["data"]
+    bw_target = mode_cfg["bw_target"]
+    nrep_tab  = mode_cfg["nrep"]
+    axis      = mode_cfg["axis"]
+
+    print("=" * 75)
+    print("MASS PHOTOMETRY MCM SIMULATION — {} ({})".format(mode_name, axis))
+    print("=" * 75)
+
+    for conc in concentrations_labels:
+        for nom_pct in nominals:
+            d     = data[(conc, nom_pct)]
+            BW_CV = bw_target[conc][nom_pct]
+            N_REP = nrep_tab[conc][nom_pct]
+
+            # ── BW instrument noise ──────────────────────────────────────────
+            # BW_CV = 0 means no between-series error (skip chi-square sampling,
+            # which would divide by zero on a zero variance estimate).
+            if BW_CV == 0:
+                BW_error = np.zeros(n_trial)
+            else:
+                var_BW = (BW_CV / 100.0 * nom_pct) ** 2
+                var_BW_samples = rinvchisq(n_trial, DF_BW, var_BW)
+                sd_BW  = np.sqrt(var_BW_samples)
+                BW_error = np.random.normal(0, sd_BW)
+
+            # ── Within-series (repeatability) variance is ALSO estimated from
+            # few observations (df = DF_W), so sample it from an inverse
+            # chi-square as well. This reproduces the Student-t /
+            # Satterthwaite widening the Enoval report applies, and is what
+            # brings the MCM risk into agreement with the report's
+            # beta-expectation risk (mean |error| 1.70 -> 0.83 pp).
+            var_w_samples = rinvchisq(n_trial, DF_W, max(d["pf_s"], 1e-6) ** 2)
+            sd_w = np.sqrt(var_w_samples)
+
+            # ── Simulate replicates directly from measured mean & SD ─────────
+            X_reps = np.zeros((n_trial, N_REP))
+            for rep in range(N_REP):
+                pct_meas = np.clip(
+                    d["pf_m"] + np.random.normal(0, sd_w), 0, 100
+                )
+                X_reps[:, rep] = np.clip(pct_meas + BW_error, 0, 100)
+
+            X_mcm   = np.clip(np.mean(X_reps, axis=1), 0, 100)
+            X_clean = X_mcm[np.isfinite(X_mcm)]
+            X_chauv, n_out, cf = apply_chauvenet(X_clean)
+
+            bias_rel  = (X_chauv - nom_pct) / nom_pct * 100.0
+            mean_bias = float(np.mean(bias_rel))
+            u_c       = float(np.std(bias_rel))
+            U_95      = 1.96 * u_c
+            eu_lo     = mean_bias - U_95
+            eu_hi     = mean_bias + U_95
+            accept_rate = float(np.mean(np.abs(bias_rel) <= MCM_BIAS_LIMIT) * 100.0)
+            pass_eu   = (eu_lo >= -MCM_BIAS_LIMIT) and (eu_hi <= MCM_BIAS_LIMIT)
+            pass_mean = abs(mean_bias) <= MCM_BIAS_LIMIT
+            pass_rate = accept_rate >= MCM_ACCEPTANCE_TARGET
+            overall   = pass_mean and pass_rate
+
+            results[(conc, nom_pct)] = {
+                "bias_rel":    bias_rel,
+                "mean_bias":   mean_bias,
+                "u_c":         u_c,
+                "U_95":        U_95,
+                "eu_lo":       eu_lo,
+                "eu_hi":       eu_hi,
+                "accept_rate": accept_rate,
+                "pass_eu":     pass_eu,
+                "pass_mean":   pass_mean,
+                "pass_rate":   pass_rate,
+                "overall":     overall,
+                "outlier_pct": n_out / len(X_clean) * 100 if len(X_clean) > 0 else 0,
+                "BW_CV":       BW_CV,
+                "N_REP":       N_REP,
+            }
+
+            print("  {:>7} {:>3}%{} | n={} BW={:.1f}% | meas={:.1f}%±{:.2f}% | bias={:+.2f}% | accept={:.1f}% | {}".format(
+                conc, nom_pct, mode_name[0], N_REP, BW_CV,
+                d["pf_m"], d["pf_s"], mean_bias, accept_rate,
+                "PASS" if overall else "FAIL"))
+
+    return results
+
+
+# ============================================================================
+# THREE PANEL PLOT (mode-parametrized)
+#   Bar panels use a CATEGORICAL x-axis so that Full and Empty are
+#   geometrically identical and no group is clipped by the axis edge.
+# ============================================================================
+
+def plot_graphs(all_results, mode_cfg, mode_name):
+    nominals = mode_cfg["nominals"]
+    axis     = mode_cfg["axis"]
+
+    pct_x    = sorted(nominals)                # ascending nominal levels
+    x_idx    = list(range(len(pct_x)))         # category positions 0..k-1
+    x_labels = ["{}%".format(p) for p in pct_x]
+    n_conc   = len(concentrations_labels)
+    x_range  = [-X_PAD, len(pct_x) - 1 + X_PAD]
+
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=("MCM Bias Distribution", "MCM Acceptance Rate",
+                        "Chauvenet Criterion - Outlier Removal Analysis", ""),
+        horizontal_spacing=0.10, vertical_spacing=0.18,
+    )
+
+    # ── GRAPH 1: Bias scatter + EU band + mean line ─────────────────────────
+    xp        = x_idx if PANEL1_CATEGORICAL else pct_x
+    jitter_sd = 0.04 if PANEL1_CATEGORICAL else 0.5
+
+    for ci, conc in enumerate(concentrations_labels):
+        col    = colors[ci]
+        means  = [all_results[(conc, p)]["mean_bias"] for p in pct_x]
+        eu_los = [all_results[(conc, p)]["eu_lo"]     for p in pct_x]
+        eu_his = [all_results[(conc, p)]["eu_hi"]     for p in pct_x]
+
+        r_int = int(col[1:3], 16); g_int = int(col[3:5], 16); b_int = int(col[5:7], 16)
+        fill_col = "rgba({},{},{},0.10)".format(r_int, g_int, b_int)
+        line_col = "rgba({},{},{},0.65)".format(r_int, g_int, b_int)
+
+        fig.add_trace(go.Scatter(
+            x=list(xp) + list(xp)[::-1], y=eu_his + eu_los[::-1],
+            fill="toself", fillcolor=fill_col, line=dict(color="rgba(0,0,0,0)"),
+            showlegend=False, hoverinfo="skip", mode="lines",
+        ), row=1, col=1)
+
+        for y_band in [eu_his, eu_los]:
+            fig.add_trace(go.Scatter(
+                x=xp, y=y_band, mode="lines",
+                line=dict(color=line_col, dash="dash", width=1.5),
+                showlegend=False, hoverinfo="skip",
+            ), row=1, col=1)
+
+        for k, pct in enumerate(pct_x):
+            xc        = xp[k]
+            bias_arr  = all_results[(conc, pct)]["bias_rel"]
+            n_scatter = min(200, len(bias_arr))
+            idx  = np.random.choice(len(bias_arr), n_scatter, replace=False)
+            vals = bias_arr[idx]
+            xjit = np.random.normal(xc, jitter_sd, n_scatter)
+            fig.add_trace(go.Scatter(
+                x=xjit, y=vals, mode="markers",
+                marker=dict(color=col, size=4, opacity=0.25),
+                showlegend=False, hoverinfo="skip",
+            ), row=1, col=1)
+            if ci == 0:
+                fig.add_annotation(
+                    x=xc, y=float(np.percentile(bias_arr, 98.5)) + 1,
+                    text="n={}".format(all_results[(conc, pct)]["N_REP"]),
+                    showarrow=False, font=dict(size=10, color="black", family="Arial Black"),
+                    yanchor="bottom", bgcolor="rgba(255,255,240,0.85)",
+                    bordercolor="gray", borderwidth=0.8, row=1, col=1,
+                )
+
+        fig.add_trace(go.Scatter(
+            x=xp, y=means, mode="lines+markers",
+            line=dict(color=col, width=2.5),
+            marker=dict(size=9, color=col, line=dict(width=2, color="white")),
+            name=conc + " cp/mL", legendgroup=conc,
+            customdata=[[p] for p in pct_x],
+            hovertemplate="<b>%{customdata[0]} " + axis +
+                          "</b><br>Mean bias: %{y:.1f}%<extra>" + conc + "</extra>",
+        ), row=1, col=1)
+
+    p1_range = x_range if PANEL1_CATEGORICAL else [0, 95]
+    for y_val, col_, dash_ in [( MCM_BIAS_LIMIT, "black", "dash"),
+                               (-MCM_BIAS_LIMIT, "black", "dash"),
+                               (0,               "gray",  "dot")]:
+        fig.add_shape(type="line", x0=p1_range[0], x1=p1_range[1],
+                      y0=y_val, y1=y_val,
+                      line=dict(color=col_, width=1.8, dash=dash_), row=1, col=1)
+
+    # ── GRAPH 2: Acceptance rate bars (categorical x) ───────────────────────
+    for ci, conc in enumerate(concentrations_labels):
+        rates  = [all_results[(conc, p)]["accept_rate"] for p in pct_x]
+        passes = [all_results[(conc, p)]["overall"]     for p in pct_x]
+        bar_cols = ["rgba(0,160,0,0.85)" if p else "rgba(210,40,40,0.85)" for p in passes]
+
+        fig.add_trace(go.Bar(
+            x=x_idx, y=rates, name=conc + " cp/mL",
+            marker_color=bar_cols, marker_line=dict(color="black", width=1),
+            text=["{:.1f}%".format(r) for r in rates], textposition="outside",
+            textfont=dict(size=9, color="black"), showlegend=False,
+        ), row=1, col=2)
+
+        # in-bar concentration label, positioned in category units
+        for k, rate in enumerate(rates):
+            if rate > 12:
+                fig.add_annotation(
+                    x=x_idx[k] + _slot_offset(ci, n_conc), y=6,
+                    text=conc, showarrow=False, textangle=-90,
+                    font=dict(size=10, color="black", family="Arial Black"),
+                    xanchor="center", yanchor="middle", row=1, col=2,
+                )
+
+    fig.add_shape(type="line", x0=x_range[0], x1=x_range[1],
+                  y0=MCM_ACCEPTANCE_TARGET, y1=MCM_ACCEPTANCE_TARGET,
+                  line=dict(color="orange", width=2.5, dash="solid"), row=1, col=2)
+
+    # ── GRAPH 3: Chauvenet outlier removal (categorical x) ──────────────────
+    for conc in concentrations_labels:
+        out_pcts = [all_results[(conc, p)]["outlier_pct"] for p in pct_x]
+        fig.add_trace(go.Bar(
+            x=x_idx, y=out_pcts, name=conc + " cp/mL",
+            marker_color="rgba(255,127,80,0.85)", marker_line=dict(color="black", width=1),
+            text=["{:.2f}%".format(v) for v in out_pcts], textposition="outside",
+            textfont=dict(size=9, color="black"), showlegend=False,
+        ), row=2, col=1)
+
+    for y_val, col_, dash_ in [(1.0, "green", "dash"), (2.5, "orange", "dash"),
+                               (5.0, "red", "dash")]:
+        fig.add_shape(type="line", x0=x_range[0], x1=x_range[1],
+                      y0=y_val, y1=y_val,
+                      line=dict(color=col_, width=2, dash=dash_), row=2, col=1)
+
+    # ── LAYOUT ──────────────────────────────────────────────────────────────
+    fig.update_layout(
+        title=dict(
+            text="Mass Photometry MCM Validation Summary — {}<br>".format(mode_name) +
+                 "<span style='font-size:16px'>{} mean &amp; SD direct | BW noise | "
+                 "Chauvenet cleaned | +/-30% acceptance limit</span>".format(axis),
+            font=dict(size=22)),
+        barmode="group", bargap=BARGAP, bargroupgap=BARGROUPGAP, plot_bgcolor="white",
+        legend=dict(title=dict(text="Concentration", font=dict(size=14)),
+                    font=dict(size=13), orientation="v", yanchor="top", y=0.97,
+                    xanchor="right", x=0.44, bgcolor="rgba(255,255,255,0.92)",
+                    bordercolor="lightgray", borderwidth=1),
+        width=1600, height=1200, margin=dict(t=150, b=80, l=60, r=30), font=dict(size=13),
+    )
+
+    xtitle = "Theoretical {}".format(axis)
+
+    # panel 1 axis
+    if PANEL1_CATEGORICAL:
+        fig.update_xaxes(tickvals=x_idx, ticktext=x_labels, range=x_range,
+                         title=xtitle, title_font=dict(size=14), tickfont=dict(size=12),
+                         tickangle=-30, showgrid=True, row=1, col=1)
+    else:
+        fig.update_xaxes(tickvals=pct_x, ticktext=x_labels, range=[0, 95],
+                         title=xtitle, title_font=dict(size=14), tickfont=dict(size=12),
+                         tickangle=-30, showgrid=True, row=1, col=1)
+
+    # panels 2 and 3: always categorical
+    for (r_, c_) in [(1, 2), (2, 1)]:
+        fig.update_xaxes(tickvals=x_idx, ticktext=x_labels, range=x_range,
+                         title=xtitle, title_font=dict(size=14), tickfont=dict(size=12),
+                         tickangle=-30, showgrid=False, row=r_, col=c_)
+
+    fig.update_yaxes(title_font=dict(size=14), tickfont=dict(size=12),
+                     showgrid=True, gridcolor="rgba(0,0,0,0.07)")
+    fig.update_yaxes(title="Relative Bias (%)", row=1, col=1)
+    fig.update_yaxes(title="% Within +/-30% Bias<br><span style='font-size:12px'>"
+                           "(Green=PASS Red=FAIL)</span>",
+                     range=[0, 108], row=1, col=2)
+    fig.update_yaxes(title="Outliers Removed (%)", row=2, col=1)
+    fig.update_traces(cliponaxis=False)
+    fig.show()
+    return fig
+
+
+# ============================================================================
+# CONCORDANCE HEATMAP (mode-parametrized, 16 rows: concentration x level)
+# ============================================================================
+
+def compute_cell_acceptance(conc, nom_pct, bw_cv, mode_cfg, n_trial, rng):
+    d     = mode_cfg["data"][(conc, nom_pct)]
+    N_REP = mode_cfg["nrep"][conc][nom_pct]
+
+    if bw_cv == 0:
+        BW_error = np.zeros(n_trial)
+    else:
+        var_BW   = (bw_cv / 100.0 * nom_pct) ** 2
+        var_samp = rinvchisq(n_trial, DF_BW, var_BW)
+        BW_error = rng.normal(0, np.sqrt(var_samp))
+
+    # within-series variance also sampled from inverse chi-square (df = DF_W)
+    var_w    = rinvchisq(n_trial, DF_W, max(d["pf_s"], 1e-6) ** 2)
+    sd_w     = np.sqrt(var_w)
+
+    X_reps = np.zeros((n_trial, N_REP))
+    for rep in range(N_REP):
+        pct_meas = np.clip(d["pf_m"] + rng.normal(0, sd_w), 0, 100)
+        X_reps[:, rep] = np.clip(pct_meas + BW_error, 0, 100)
+
+    X_mcm   = np.clip(np.mean(X_reps, axis=1), 0, 100)
+    X_clean = X_mcm[np.isfinite(X_mcm)]
+    if len(X_clean) == 0:
+        return 0.0
+    bias = (X_clean - nom_pct) / nom_pct * 100.0
+    return float(np.mean(np.abs(bias) <= MCM_BIAS_LIMIT) * 100.0)
+
+
+def plot_concordance_heatmap(mode_cfg, mode_name, seed=123):
+    nominals = mode_cfg["nominals"]
+    axis     = mode_cfg["axis"]
+    meas_bw  = mode_cfg["meas_bw"]
+    val_pass = mode_cfg["val_pass"]
+    nrep_tab = mode_cfg["nrep"]
+
+    rng = np.random.default_rng(seed)
+    bw_sweep = np.linspace(0, HM_BW_CV_MAX, HM_N_STEPS)
+
+    # Row order bottom->top: low conc/low level first; y-axis reversed puts high conc on top
+    row_cells = []
+    for conc in concentrations_labels:                 # low -> high concentration
+        for pct in sorted(nominals):                   # low -> high level
+            row_cells.append((conc, pct))
+
+    n_rows = len(row_cells)
+    acc_matrix = np.zeros((n_rows, HM_N_STEPS))
+
+    print("\nBuilding MP concordance heatmap — {} ({})".format(mode_name, axis))
+    print("  BW CV sweep : 0 -> {}%  ({} steps)".format(HM_BW_CV_MAX, HM_N_STEPS))
+    print("  Trials/cell : {:,}  |  Total cells: {}".format(HM_N_TRIAL, n_rows * HM_N_STEPS))
+
+    for r, (conc, pct) in enumerate(row_cells):
+        for j, bw in enumerate(bw_sweep):
+            acc_matrix[r, j] = compute_cell_acceptance(conc, pct, bw, mode_cfg, HM_N_TRIAL, rng)
+        print("  {:>7} {:>3}%{}  (n={}) -- done".format(conc, pct, mode_name[0], nrep_tab[conc][pct]))
+
+    y_labels = ["{} cp/mL @ {}{}  n={}".format(conc, pct, axis, nrep_tab[conc][pct])
+                for (conc, pct) in row_cells]
+
+    fig = go.Figure()
+    fig.add_trace(go.Heatmap(
+        z=acc_matrix, x=bw_sweep, y=list(range(n_rows)),
+        colorscale="RdYlGn", zmin=0, zmax=100,
+        colorbar=dict(title=dict(
+            text="MCM Acceptance Rate<br>(% within +/-{:.0f}% bias)".format(MCM_BIAS_LIMIT),
+            side="right"), len=0.9),
+        hovertemplate="BW CV: %{x:.1f}%<br>Acceptance: %{z:.1f}%<extra></extra>",
+    ))
+
+    # Per-row navy threshold bar
+    for r in range(n_rows):
+        below = np.where(acc_matrix[r] < MCM_ACCEPTANCE_TARGET)[0]
+        if len(below) > 0:
+            thr = bw_sweep[below[0]]
+            fig.add_shape(type="line", x0=thr, x1=thr, y0=r - 0.45, y1=r + 0.45,
+                          line=dict(color="navy", width=4), layer="above")
+
+    # Measured-BW diamonds with concordance colouring
+    legend_seen = set()
+    for r, (conc, pct) in enumerate(row_cells):
+        bw_meas  = meas_bw[conc][pct]
+        vpass    = val_pass[conc][pct]
+        j_near   = int(np.argmin(np.abs(bw_sweep - bw_meas)))
+        mcm_acc  = acc_matrix[r, j_near]
+        mcm_pass = mcm_acc >= MCM_ACCEPTANCE_TARGET
+
+        if mcm_pass and vpass:
+            colr, key, lbl = "#00E5FF", "cp", "Concordant - both PASS"
+        elif (not mcm_pass) and (not vpass):
+            colr, key, lbl = "#FF3030", "cf", "Concordant - both FAIL"
+        else:
+            colr, key, lbl = "#FFA500", "dc", "Discordant (MCM != Validation)"
+
+        show = key not in legend_seen
+        legend_seen.add(key)
+
+        fig.add_trace(go.Scatter(
+            x=[bw_meas], y=[r], mode="markers+text",
+            marker=dict(symbol="diamond", size=16, color=colr, line=dict(color="white", width=1.5)),
+            text=["  {:.1f}% ({:.0f}%)".format(bw_meas, mcm_acc)],
+            textposition="middle right", textfont=dict(size=9, color="black"),
+            name=lbl, legendgroup=key, showlegend=show,
+            hovertemplate="{} @ {}{}<br>Measured BW: {:.1f}%<br>MCM acceptance: {:.0f}%<extra></extra>".format(
+                conc, pct, axis, bw_meas, mcm_acc),
+        ))
+
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None], mode="lines", line=dict(color="navy", width=4),
+        name="{:.0f}% acceptance threshold".format(MCM_ACCEPTANCE_TARGET), showlegend=True,
+    ))
+
+    fig.update_layout(
+        title=dict(
+            text="Mass Photometry MCM Concordance Heatmap — {} ({})<br>".format(mode_name, axis) +
+                 "<span style='font-size:14px'>Acceptance rate vs between-series precision | "
+                 "diamonds = measured BW CV (annotation: BW%, MCM acceptance%) | "
+                 "navy bar = {:.0f}% threshold</span>".format(MCM_ACCEPTANCE_TARGET),
+            font=dict(size=20)),
+        xaxis=dict(title="Between-Series CV (%)", title_font=dict(size=14),
+                   range=[0, HM_BW_CV_MAX], showgrid=False),
+        yaxis=dict(tickmode="array", tickvals=list(range(n_rows)), ticktext=y_labels,
+                   tickfont=dict(size=11, family="monospace"),
+                   title="Concentration @ {}".format(axis), title_font=dict(size=14),
+                   autorange="reversed"),
+        plot_bgcolor="white",
+        legend=dict(font=dict(size=11), bgcolor="rgba(255,255,255,0.9)",
+                    bordercolor="gray", borderwidth=1, yanchor="top", y=0.99,
+                    xanchor="right", x=0.99),
+        width=1500, height=900, margin=dict(t=120, b=70, l=240, r=40),
+    )
+    fig.show()
+    return fig, acc_matrix, row_cells
+
+
+# ============================================================================
+# SUMMARY TABLE (mode-parametrized)
+# ============================================================================
+
+def print_summary(all_results, mode_cfg, mode_name):
+    nominals = mode_cfg["nominals"]
+    axis     = mode_cfg["axis"]
+    pct_x    = sorted(nominals)
+    print("\n" + "=" * 115)
+    print("MASS PHOTOMETRY MCM VALIDATION SUMMARY — {} ({})".format(mode_name, axis))
+    print("=" * 115)
+    print("  {:>8} {:>6} | {:>6} | {:>5} | {:>9} | {:>8} | {:>24} | {:>8}".format(
+        "Conc", axis, "BW CV", "n rep", "Mean Bias", "U95", "EU [lo, hi]", "Accept%"))
+    print("-" * 115)
+    for conc in concentrations_labels:
+        for pct in pct_x:
+            r = all_results[(conc, pct)]
+            print("  {:>8} {:>5}% | {:>5.1f}% | {:>5} | {:>+8.2f}% | {:>7.2f}% | [{:>+9.2f},{:>+9.2f}]% | {:>7.1f}%".format(
+                conc, pct, r["BW_CV"], r["N_REP"], r["mean_bias"], r["U_95"],
+                r["eu_lo"], r["eu_hi"], r["accept_rate"]))
+        print()
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+if __name__ == "__main__":
+    for mode_name, mode_cfg in MODES.items():
+        results = run_mp_mcm(mode_cfg, mode_name)
+        print_summary(results, mode_cfg, mode_name)
+        plot_graphs(results, mode_cfg, mode_name)
+        plot_concordance_heatmap(mode_cfg, mode_name)
+    print("\nAll done.")
